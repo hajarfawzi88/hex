@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
+import json
 load_dotenv()
 
 HAMSA_API_KEY = os.getenv("HAMSA_API_KEY")
@@ -133,6 +133,66 @@ async def stt_file(file: UploadFile = File(...)):
     data = r.json()
     text = ((data.get("data") or {}).get("text") or "").strip()
     return {"text": text, "raw": data}
+
+
+
+
+
+
+
+
+@app.websocket("/ws/stt")
+async def websocket_stt(ws: WebSocket):
+    """
+    Realtime STT WebSocket endpoint.
+    - Client sends base64 chunks of audio in JSON format:
+        {"audioBase64": "...", "language": "ar"}
+    - Server replies with incremental text segments:
+        {"partial_text": "..."}
+    - When done, client sends {"event": "end"} to close gracefully.
+    """
+    await ws.accept()
+    print("🎧 Client connected to /ws/stt")
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            while True:
+                msg = await ws.receive_text()
+                data = json.loads(msg)
+
+                if data.get("event") == "end":
+                    await ws.send_json({"status": "done"})
+                    break
+
+                b64 = data.get("audioBase64")
+                lang = data.get("language", "ar")
+
+                if not b64:
+                    await ws.send_json({"error": "Missing audioBase64"})
+                    continue
+
+                payload = {
+                    "audioBase64": b64,
+                    "language": lang,
+                    "isEosEnabled": False,
+                    "eosThreshold": 0.3
+                }
+
+                r = await client.post(HAMSA_STT_URL, headers=_hamsa_headers(), json=payload)
+                if r.status_code != 200:
+                    await ws.send_json({"error": f"Hamsa STT failed {r.status_code}"})
+                    continue
+
+                res = r.json()
+                text = ((res.get("data") or {}).get("text") or "").strip()
+                if text:
+                    await ws.send_json({"partial_text": text})
+
+    except WebSocketDisconnect:
+        print("❌ Client disconnected.")
+    except Exception as e:
+        print("⚠️ Error:", e)
+        await ws.close(code=1011)
 
 # -------------------------
 # WebSocket: TTS
