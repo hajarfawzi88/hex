@@ -189,12 +189,33 @@ async def ws_tts(ws: WebSocket):
                     },
                 )
 
-                if r.status_code == 200:
-                    audio = r.json().get("audioBase64")
-                    if audio:
-                        await ws.send_json({"audioBase64": audio})
+                if r.status_code != 200:
+                    await ws.send_json({
+                        "error": "Hamsa TTS failed",
+                        "status": r.status_code,
+                        "body": r.text,
+                    })
+                    continue
+
+                ctype = (r.headers.get("Content-Type") or "").lower()
+
+                # ✅ Case 1: JSON response
+                if "application/json" in ctype:
+                    j = r.json()
+                    b64 = j.get("audioBase64")
+                    if not b64:
+                        await ws.send_json({"error": "No audioBase64 in JSON"})
+                        continue
+                    await ws.send_json({"audioBase64": b64})
+
+                # ✅ Case 2: RAW WAV bytes (your case)
+                else:
+                    audio_bytes = r.content
+                    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                    await ws.send_json({"audioBase64": audio_b64})
 
         except WebSocketDisconnect:
             pass
         finally:
             await ws.close()
+
