@@ -242,5 +242,62 @@ async def ws_tts(ws: WebSocket):
             pass
         finally:
             await ws.close()
+import numpy as np
+import asyncio
+
+@app.websocket("/ws/stt_stream")
+async def ws_stt_stream(ws: WebSocket):
+    await ws.accept()
+
+    audio_buffer = bytearray()
+    language = "ar"
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            while True:
+                message = await ws.receive()
+
+                # ---- Control messages (JSON) ----
+                if "text" in message:
+                    data = json.loads(message["text"])
+
+                    if data.get("event") == "start":
+                        language = data.get("language", "ar")
+                        audio_buffer.clear()
+                        await ws.send_json({"event": "ready"})
+
+                    elif data.get("event") == "end_utterance":
+                        # send accumulated audio to Hamsa
+                        audio_b64 = base64.b64encode(audio_buffer).decode("utf-8")
+
+                        r = await client.post(
+                            HAMSA_STT_URL,
+                            headers=_hamsa_headers(),
+                            json={
+                                "audioBase64": audio_b64,
+                                "language": language,
+                                "isEosEnabled": False,
+                            },
+                        )
+
+                        if r.status_code == 200:
+                            text = ((r.json().get("data") or {}).get("text") or "")
+                            await ws.send_json({"event": "final", "text": text})
+
+                        audio_buffer.clear()
+
+                    elif data.get("event") == "close":
+                        break
+
+                # ---- Binary PCM audio ----
+                elif "bytes" in message:
+                    audio_buffer.extend(message["bytes"])
+
+        except WebSocketDisconnect:
+            pass
+
+        finally:
+            await ws.close()
+
 
 
