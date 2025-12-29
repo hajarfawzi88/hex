@@ -91,7 +91,7 @@ async def _call_hamsa_tts(payload: dict) -> tuple[bytes, str]:
 # -------------------------
 # Routes
 # -------------------------
-@app.get("/health")
+@app.get("/")
 def health():
     return {"ok": True}
 
@@ -134,109 +134,63 @@ async def stt_file(file: UploadFile = File(...)):
     text = ((data.get("data") or {}).get("text") or "").strip()
     return {"text": text, "raw": data}
 
-
-
-
-
-
-
-
+# ---------------- STT ----------------
 @app.websocket("/ws/stt")
-async def websocket_stt(ws: WebSocket):
-    """
-    Realtime STT WebSocket endpoint.
-    - Client sends base64 chunks of audio in JSON format:
-        {"audioBase64": "...", "language": "ar"}
-    - Server replies with incremental text segments:
-        {"partial_text": "..."}
-    - When done, client sends {"event": "end"} to close gracefully.
-    """
-    await ws.accept()
-    print("🎧 Client connected to /ws/stt")
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            while True:
-                msg = await ws.receive_text()
-                data = json.loads(msg)
-
-                if data.get("event") == "end":
-                    await ws.send_json({"status": "done"})
-                    break
-
-                b64 = data.get("audioBase64")
-                lang = data.get("language", "ar")
-
-                if not b64:
-                    await ws.send_json({"error": "Missing audioBase64"})
-                    continue
-
-                payload = {
-                    "audioBase64": b64,
-                    "language": lang,
-                    "isEosEnabled": False,
-                    "eosThreshold": 0.3
-                }
-
-                r = await client.post(HAMSA_STT_URL, headers=_hamsa_headers(), json=payload)
-                if r.status_code != 200:
-                    await ws.send_json({"error": f"Hamsa STT failed {r.status_code}"})
-                    continue
-
-                res = r.json()
-                text = ((res.get("data") or {}).get("text") or "").strip()
-                if text:
-                    await ws.send_json({"partial_text": text})
-
-    except WebSocketDisconnect:
-        print("❌ Client disconnected.")
-    except Exception as e:
-        print("⚠️ Error:", e)
-        await ws.close(code=1011)
-
-# -------------------------
-# WebSocket: TTS
-# -------------------------
-@app.websocket("/ws/tts")
-async def ws_tts(ws: WebSocket):
-    """
-    WebSocket protocol:
-
-    Client sends JSON:
-      {
-        "text": "...",
-        "speaker": "Majd",
-        "dialect": "egy",
-        "mulaw": false,
-        "mode": "bytes" | "base64"   (optional, default "bytes")
-      }
-
-    Server responds:
-      - if mode="bytes": sends audio bytes as a binary frame
-      - if mode="base64": sends {"audioBase64": "..."} as JSON
-    """
+async def ws_stt(ws: WebSocket):
     await ws.accept()
     try:
         while True:
-            msg = await ws.receive_json()
+            msg = await ws.receive_text()
+            data = json.loads(msg)
 
-            text = (msg.get("text") or "").strip()
-            speaker = (msg.get("speaker") or "").strip()
-            dialect = (msg.get("dialect") or "msa").strip()
-            mulaw = bool(msg.get("mulaw") or False)
-            mode = (msg.get("mode") or "bytes").strip().lower()
+            if data.get("event") == "end":
+                break
 
-            if not text or not speaker:
-                await ws.send_json({"error": "text and speaker are required"})
-                continue
+            r = requests.post(
+                STT_URL,
+                headers={"Authorization": f"Token {HAMSA_KEY}"},
+                json={
+                    "audioBase64": data["audioBase64"],
+                    "language": "ar",
+                    "isEosEnabled": False,
+                },
+                timeout=10,
+            )
 
-            payload = {"text": text, "speaker": speaker, "dialect": dialect, "mulaw": mulaw}
-            audio_bytes, _ = await _call_hamsa_tts(payload)
+            if r.status_code == 200:
+                text = r.json().get("data", {}).get("text", "")
+                if text:
+                    await ws.send_json({"text": text})
+    finally:
+        await ws.close()
 
-            if mode == "base64":
-                await ws.send_json({"audioBase64": base64.b64encode(audio_bytes).decode("utf-8")})
-            else:
-                await ws.send_bytes(audio_bytes)
+# ---------------- TTS ----------------
+@app.websocket("/ws/tts")
+async def ws_tts(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            msg = await ws.receive_text()
+            data = json.loads(msg)
 
-    except WebSocketDisconnect:
-        return
+            if data.get("event") == "end":
+                break
+
+            r = requests.post(
+                TTS_URL,
+                headers={"Authorization": f"Token {HAMSA_KEY}"},
+                json={
+                    "text": data["text"],
+                    "speaker": data.get("speaker", "Ahmed"),
+                    "dialect": data.get("dialect", "msa"),
+                    "mulaw": False,
+                },
+                timeout=10,
+            )
+
+            if r.status_code == 200:
+                audio = r.json().get("audioBase64")
+                if audio:
+                    await ws.send_json({"audioBase64": audio})
+    finally:
+        await ws.close()
