@@ -249,25 +249,99 @@ import wave
 import httpx
 from fastapi import WebSocket, WebSocketDisconnect
 
+import base64, json, io, wave, asyncio, time
+import httpx
+from fastapi import WebSocket, WebSocketDisconnect
+
+PARTIAL_EVERY_SEC = 0.9
+MIN_PARTIAL_SEC = 0.8
+
+def pcm_to_wav_b64(pcm_bytes: bytes, sample_rate: int = 16000) -> str:
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return base64.b64encode(wav_io.getvalue()).decode("utf-8")
+
+def approx_duration_sec(num_pcm_bytes: int, sample_rate: int = 16000) -> float:
+    # 2 bytes per sample, mono
+    return num_pcm_bytes / (sample_rate * 2)
+
 @app.websocket("/ws/stt_stream")
 async def ws_stt_stream(ws: WebSocket):
     await ws.accept()
 
     audio_buffer = bytearray()
     language = "ar"
+    sample_rate = 16000
+
+    last_partial_at = 0.0
+    last_partial_len = 0
+    last_partial_text = ""
+
+    partial_lock = asyncio.Lock()
+    closed = False
+
+    async def send_partial_if_needed(client: httpx.AsyncClient):
+        nonlocal last_partial_at, last_partial_len, last_partial_text
+
+        now = time.monotonic()
+        if now - last_partial_at < PARTIAL_EVERY_SEC:
+            return
+
+        if approx_duration_sec(len(audio_buffer), sample_rate) < MIN_PARTIAL_SEC:
+            return
+
+        # Only if new audio since last partial
+        if len(audio_buffer) <= last_partial_len:
+            return
+
+        # Avoid overlapping STT calls
+        if partial_lock.locked():
+            return
+
+        async with partial_lock:
+            last_partial_at = now
+            last_partial_len = len(audio_buffer)
+
+            wav_b64 = pcm_to_wav_b64(bytes(audio_buffer), sample_rate)
+            r = await client.post(
+                HAMSA_STT_URL,
+                headers=_hamsa_headers(),
+                json={
+                    "audioBase64": wav_b64,
+                    "language": language,
+                    "isEosEnabled": False,
+                },
+            )
+
+            if r.status_code != 200:
+                return
+
+            text = ((r.json().get("data") or {}).get("text") or "").strip()
+
+            # reduce spam: only send if changed
+            if text and text != last_partial_text:
+                last_partial_text = text
+                await ws.send_json({"event": "partial", "text": text})
 
     async with httpx.AsyncClient(timeout=60) as client:
         try:
             while True:
                 message = await ws.receive()
 
-                # ---------- JSON control messages ----------
                 if "text" in message:
                     data = json.loads(message["text"])
 
                     if data.get("event") == "start":
                         language = data.get("language", "ar")
+                        sample_rate = int(data.get("sample_rate", 16000))
                         audio_buffer.clear()
+                        last_partial_at = 0.0
+                        last_partial_len = 0
+                        last_partial_text = ""
                         await ws.send_json({"event": "ready"})
 
                     elif data.get("event") == "end_utterance":
@@ -275,17 +349,7 @@ async def ws_stt_stream(ws: WebSocket):
                             await ws.send_json({"event": "final", "text": ""})
                             continue
 
-                        # PCM → WAV
-                        wav_io = io.BytesIO()
-                        with wave.open(wav_io, "wb") as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)      # 16-bit
-                            wf.setframerate(16000)
-                            wf.writeframes(audio_buffer)
-
-                        wav_b64 = base64.b64encode(wav_io.getvalue()).decode()
-
-                        # Send to Hamsa
+                        wav_b64 = pcm_to_wav_b64(bytes(audio_buffer), sample_rate)
                         r = await client.post(
                             HAMSA_STT_URL,
                             headers=_hamsa_headers(),
@@ -298,26 +362,31 @@ async def ws_stt_stream(ws: WebSocket):
 
                         text = ""
                         if r.status_code == 200:
-                            text = ((r.json().get("data") or {}).get("text") or "")
+                            text = ((r.json().get("data") or {}).get("text") or "").strip()
 
-                        await ws.send_json({
-                            "event": "final",
-                            "text": text
-                        })
+                        await ws.send_json({"event": "final", "text": text})
 
                         audio_buffer.clear()
+                        last_partial_at = 0.0
+                        last_partial_len = 0
+                        last_partial_text = ""
 
                     elif data.get("event") == "close":
                         break
 
-                # ---------- Binary PCM audio ----------
                 elif "bytes" in message:
                     audio_buffer.extend(message["bytes"])
+                    # fire best-effort partials opportunistically
+                    await send_partial_if_needed(client)
 
         except WebSocketDisconnect:
             pass
         finally:
-            await ws.close()
+            if not closed:
+                closed = True
+                await ws.close()
+
+
 
 
 
