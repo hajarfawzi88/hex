@@ -280,7 +280,7 @@ async def ws_stt_stream(ws: WebSocket):
                         last_partial_text = ""
                         await ws.send_json({"event": "ready"})
 
-                    elif ev == "end_utterance":
+                    elif ev == "end":
                         if not audio_buffer:
                             await ws.send_json({"event": "final", "text": ""})
                             continue
@@ -318,3 +318,4 @@ async def ws_stt_stream(ws: WebSocket):
             pass
         finally:
             await ws.close()
+
