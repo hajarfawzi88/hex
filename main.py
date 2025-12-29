@@ -1,7 +1,7 @@
 import os
 import base64
 from typing import Literal, Optional
-
+import requests
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
@@ -147,8 +147,8 @@ async def ws_stt(ws: WebSocket):
                 break
 
             r = requests.post(
-                STT_URL,
-                headers={"Authorization": f"Token {HAMSA_KEY}"},
+                HAMSA_STT_URL,
+                headers={"Authorization": f"Token {HAMSA_API_KEY}"},
                 json={
                     "audioBase64": data["audioBase64"],
                     "language": "ar",
@@ -177,8 +177,8 @@ async def ws_tts(ws: WebSocket):
                 break
 
             r = requests.post(
-                TTS_URL,
-                headers={"Authorization": f"Token {HAMSA_KEY}"},
+                HAMSA_TTS_URL,
+                headers={"Authorization": f"Token {HAMSA_API_KEY}"},
                 json={
                     "text": data["text"],
                     "speaker": data.get("speaker", "Ahmed"),
