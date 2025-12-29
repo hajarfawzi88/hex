@@ -242,8 +242,12 @@ async def ws_tts(ws: WebSocket):
             pass
         finally:
             await ws.close()
-import numpy as np
-import asyncio
+import base64
+import json
+import io
+import wave
+import httpx
+from fastapi import WebSocket, WebSocketDisconnect
 
 @app.websocket("/ws/stt_stream")
 async def ws_stt_stream(ws: WebSocket):
@@ -257,7 +261,7 @@ async def ws_stt_stream(ws: WebSocket):
             while True:
                 message = await ws.receive()
 
-                # ---- Control messages (JSON) ----
+                # ---------- JSON control messages ----------
                 if "text" in message:
                     data = json.loads(message["text"])
 
@@ -267,37 +271,54 @@ async def ws_stt_stream(ws: WebSocket):
                         await ws.send_json({"event": "ready"})
 
                     elif data.get("event") == "end_utterance":
-                        # send accumulated audio to Hamsa
-                        audio_b64 = base64.b64encode(audio_buffer).decode("utf-8")
+                        if not audio_buffer:
+                            await ws.send_json({"event": "final", "text": ""})
+                            continue
 
+                        # PCM → WAV
+                        wav_io = io.BytesIO()
+                        with wave.open(wav_io, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)      # 16-bit
+                            wf.setframerate(16000)
+                            wf.writeframes(audio_buffer)
+
+                        wav_b64 = base64.b64encode(wav_io.getvalue()).decode()
+
+                        # Send to Hamsa
                         r = await client.post(
                             HAMSA_STT_URL,
                             headers=_hamsa_headers(),
                             json={
-                                "audioBase64": audio_b64,
+                                "audioBase64": wav_b64,
                                 "language": language,
                                 "isEosEnabled": False,
                             },
                         )
 
+                        text = ""
                         if r.status_code == 200:
                             text = ((r.json().get("data") or {}).get("text") or "")
-                            await ws.send_json({"event": "final", "text": text})
+
+                        await ws.send_json({
+                            "event": "final",
+                            "text": text
+                        })
 
                         audio_buffer.clear()
 
                     elif data.get("event") == "close":
                         break
 
-                # ---- Binary PCM audio ----
+                # ---------- Binary PCM audio ----------
                 elif "bytes" in message:
                     audio_buffer.extend(message["bytes"])
 
         except WebSocketDisconnect:
             pass
-
         finally:
             await ws.close()
+
 
 
 
