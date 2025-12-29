@@ -135,34 +135,58 @@ async def stt_file(file: UploadFile = File(...)):
     return {"text": text, "raw": data}
 
 # ---------------- STT ----------------
+from fastapi import WebSocket, WebSocketDisconnect
+import json
+import httpx
+
 @app.websocket("/ws/stt")
 async def ws_stt(ws: WebSocket):
     await ws.accept()
-    try:
-        while True:
-            msg = await ws.receive_text()
-            data = json.loads(msg)
 
-            if data.get("event") == "end":
-                break
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            while True:
+                msg = await ws.receive_text()
 
-            r = requests.post(
-                HAMSA_STT_URL,
-                headers={"Authorization": f"Token {HAMSA_API_KEY}"},
-                json={
-                    "audioBase64": data["audioBase64"],
-                    "language": "ar",
-                    "isEosEnabled": False,
-                },
-                timeout=10,
-            )
+                # ---- Safe JSON parsing ----
+                try:
+                    data = json.loads(msg)
+                except json.JSONDecodeError:
+                    await ws.send_json({"error": "Invalid JSON"})
+                    continue
 
-            if r.status_code == 200:
-                text = r.json().get("data", {}).get("text", "")
+                if data.get("event") == "end":
+                    break
+
+                # ---- Call Hamsa STT (async) ----
+                r = await client.post(
+                    HAMSA_STT_URL,
+                    headers={"Authorization": f"Token {HAMSA_API_KEY}"},
+                    json={
+                        "audioBase64": data["audioBase64"],
+                        "language": data.get("language", "ar"),
+                        "isEosEnabled": False,
+                    },
+                )
+
+                if r.status_code != 200:
+                    await ws.send_json({
+                        "error": "STT failed",
+                        "status": r.status_code,
+                        "body": r.text,
+                    })
+                    continue
+
+                text = ((r.json().get("data") or {}).get("text") or "").strip()
                 if text:
                     await ws.send_json({"text": text})
-    finally:
-        await ws.close()
+
+        except WebSocketDisconnect:
+            print("🔌 STT client disconnected")
+
+        finally:
+            await ws.close()
+
 
 # ---------------- TTS ----------------
 @app.websocket("/ws/tts")
@@ -218,4 +242,5 @@ async def ws_tts(ws: WebSocket):
             pass
         finally:
             await ws.close()
+
 
